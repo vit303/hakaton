@@ -1,0 +1,11 @@
+pymupdf
+python-pptx
+python-docx
+openpyxl
+python-dotenv
+pandas
+pillow
+numpy
+transformers>=4.57
+accelerate
+huggingface_hub
