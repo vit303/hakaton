@@ -10,7 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from rag.access import filter_hits, map_sources, normalize_title, resolve_allowed, titles_match
+from rag.access import (
+    filter_hits,
+    map_sources,
+    normalize_title,
+    repair_mojibake,
+    resolve_allowed,
+    titles_match,
+)
 from rag.engine import _parse_clusters
 
 
@@ -19,6 +26,14 @@ class AccessBridgeTests(unittest.TestCase):
         self.assertTrue(titles_match("Политика доступного филиала", "политика доступного филиала"))
         self.assertFalse(titles_match("Политика секретного филиала", "Политика доступного филиала"))
         self.assertFalse(titles_match("филиала", "Политика доступного филиала"))
+
+    def test_mojibake_titles_match(self):
+        broken = "Антикоррупционная политика.pptx".encode("utf-8").decode("cp866")
+        self.assertEqual(repair_mojibake(broken), "Антикоррупционная политика.pptx")
+        self.assertTrue(titles_match(broken, "Антикоррупционная политика"))
+        allowed = [{"id": "anti", "title": "Антикоррупционная политика", "version": 1}]
+        hit = {"source_name": broken, "page": 1}
+        self.assertEqual(resolve_allowed(hit, allowed)["id"], "anti")
 
     def test_resolve_by_document_id(self):
         allowed = [{"id": "doc-a", "title": "Политика доступного филиала", "version": 2}]

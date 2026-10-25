@@ -11,8 +11,22 @@ from pathlib import Path
 from typing import Any
 
 
+def repair_mojibake(value: str) -> str:
+    """Восстановить UTF-8 имя, ошибочно прочитанное как CP866 (частый сбой на Windows)."""
+    text = value or ""
+    if not text:
+        return text
+    # Уже нормальный кириллический текст трогать не нужно.
+    if re.search(r"[а-яА-ЯёЁ]", text) and "╨" not in text and "┐" not in text:
+        return text
+    try:
+        return text.encode("cp866").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
 def normalize_title(value: str) -> str:
-    text = (value or "").strip().lower().replace("ё", "е")
+    text = repair_mojibake(value or "").strip().lower().replace("ё", "е")
     text = Path(text).stem if "." in Path(text).name and " " not in text[-5:] else text
     text = re.sub(r"[\s_\-–—]+", " ", text)
     text = re.sub(r"[«»\"'()\[\]{}.,;:!?]+", "", text)
@@ -34,7 +48,9 @@ def resolve_allowed(hit: dict[str, Any] | Any, allowed: list[dict]) -> dict | No
     meta = hit if isinstance(hit, dict) else _hit_as_dict(hit)
     doc_id = str(meta.get("korsik_document_id") or meta.get("document_id") or "").strip()
     version = meta.get("korsik_version")
-    name = str(meta.get("source_name") or meta.get("name") or "")
+    name = str(
+        meta.get("korsik_title") or meta.get("source_name") or meta.get("name") or ""
+    )
     for doc in allowed:
         allowed_id = str(doc.get("id") or "").strip()
         if not allowed_id:
@@ -86,6 +102,7 @@ def _hit_as_dict(hit: Any) -> dict[str, Any]:
     return {
         "source_name": getattr(hit, "source_name", ""),
         "name": getattr(hit, "source_name", ""),
+        "korsik_title": getattr(hit, "korsik_title", ""),
         "page": getattr(hit, "page", 0),
         "korsik_document_id": getattr(hit, "korsik_document_id", ""),
         "korsik_version": getattr(hit, "korsik_version", None),

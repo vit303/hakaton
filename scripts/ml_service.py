@@ -158,7 +158,7 @@ def _bind_image_docs(images: list[dict], sources: list[dict], answer) -> list[di
     return images
 
 
-def _to_answer_payload(answer, allowed: list[dict]) -> dict:
+def _to_answer_payload(answer, allowed: list[dict] | None) -> dict:
     topics = _topics(answer)
     text = (answer.text or "").strip() or NO_INFO
 
@@ -185,7 +185,37 @@ def _to_answer_payload(answer, allowed: list[dict]) -> dict:
         }
 
     if answer.mode == "rag":
-        # Источники только из ACL; без подтверждённого источника — честный not_found.
+        # None = без ACL (локальный режим): достаточно текста ответа.
+        # Список = только документы из ACL; без источника — not_found.
+        if allowed is None:
+            if text == NO_INFO:
+                return {
+                    "status": "not_found",
+                    "answer": text[:12000],
+                    "sources": [],
+                    "topics": topics or ["documents"],
+                    "needs_hr": True,
+                    "images": [],
+                    "processor_version": PROCESSOR,
+                }
+            images = _register_images(answer)
+            return {
+                "status": "answered",
+                "answer": text[:12000],
+                "sources": [
+                    {
+                        "document_id": str(item.get("document_id") or item.get("name") or "local"),
+                        "version": int(item.get("version") or 1),
+                        "page": item.get("page") if isinstance(item.get("page"), int) else None,
+                    }
+                    for item in (answer.sources or [])
+                ],
+                "topics": topics or ["documents"],
+                "needs_hr": False,
+                "images": images,
+                "processor_version": PROCESSOR,
+            }
+
         if allowed:
             if answer.sources and all("document_id" in item for item in answer.sources):
                 sources = [
@@ -271,9 +301,13 @@ def v1_answer():
     question = str(payload.get("question") or "").strip()
     if not question:
         return jsonify({"error": "question required"}), 400
-    allowed = payload.get("allowed_documents") or []
-    if not isinstance(allowed, list):
-        allowed = []
+    # Нет ключа → без ACL (локальный клиент). Пустой список → явный запрет всех документов.
+    if "allowed_documents" in payload:
+        allowed = payload.get("allowed_documents")
+        if not isinstance(allowed, list):
+            allowed = []
+    else:
+        allowed = None
     history = payload.get("history") or []
     if not isinstance(history, list):
         history = []

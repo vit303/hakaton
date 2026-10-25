@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from rag.access import filter_hits, map_sources
+from rag.access import filter_hits, map_sources, repair_mojibake
 from rag.config import (
     HR_CONTACT,
     IMAGE_DIR,
@@ -576,7 +576,7 @@ def _add_one(path: Path, caption: bool, log, extra_meta: dict | None = None) -> 
     if image_dir.exists():
         shutil.rmtree(image_dir)
     image_dir.mkdir(parents=True, exist_ok=True)
-    display_name = str((extra_meta or {}).get("korsik_title") or parsed.name)
+    display_name = repair_mojibake(str((extra_meta or {}).get("korsik_title") or parsed.name))
     chunks, image_count, skipped = _chunks_from_blocks(
         parsed.source,
         display_name,
