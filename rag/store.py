@@ -25,6 +25,9 @@ class Hit:
     page: int
     image_path: str
     score: float
+    korsik_document_id: str = ""
+    korsik_version: int | None = None
+    korsik_title: str = ""
 
 
 class Embedder:
@@ -135,6 +138,22 @@ class KnowledgeBase:
         self._save()
         return deleted
 
+    def delete_korsik_document(self, document_id: str) -> int:
+        document_id = str(document_id or "").strip()
+        if not document_id:
+            return 0
+        stored = self._load()
+        kept = [
+            item
+            for item in stored
+            if str(item.get("metadata", {}).get("korsik_document_id") or "") != document_id
+        ]
+        deleted = len(stored) - len(kept)
+        self._records = kept
+        self._matrix = None
+        self._save()
+        return deleted
+
     def clear(self) -> int:
         stored = self._load()
         deleted = len(stored)
@@ -165,6 +184,7 @@ class KnowledgeBase:
             kind = str(meta.get("kind") or "text")
             if kind == "table":
                 lexical += 0.08
+            version = meta.get("korsik_version")
             hits.append(
                 Hit(
                     text=text,
@@ -174,6 +194,9 @@ class KnowledgeBase:
                     page=int(meta.get("page") or 0),
                     image_path=str(meta.get("image_path") or ""),
                     score=float(scores[index]) + 0.2 * lexical,
+                    korsik_document_id=str(meta.get("korsik_document_id") or ""),
+                    korsik_version=int(version) if version is not None else None,
+                    korsik_title=str(meta.get("korsik_title") or ""),
                 )
             )
         hits.sort(key=lambda item: item.score, reverse=True)
@@ -188,6 +211,7 @@ class KnowledgeBase:
             path = str(meta.get("image_path") or "")
             if not path:
                 continue
+            version = meta.get("korsik_version")
             hits.append(
                 Hit(
                     text=item["text"],
@@ -197,6 +221,9 @@ class KnowledgeBase:
                     page=page,
                     image_path=path,
                     score=0.0,
+                    korsik_document_id=str(meta.get("korsik_document_id") or ""),
+                    korsik_version=int(version) if version is not None else None,
+                    korsik_title=str(meta.get("korsik_title") or ""),
                 )
             )
         return hits

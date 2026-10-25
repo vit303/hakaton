@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from rag.access import filter_hits, map_sources
 from rag.config import (
     HR_CONTACT,
     IMAGE_DIR,
@@ -187,7 +188,8 @@ def _parse_clusters(raw: str) -> list[dict]:
             seen.add(key)
             chosen.append({"id": key, "label": label})
     if not chosen:
-        chosen.append({"id": "ok", "label": _CLUSTER_BY_ID["ok"]})
+        # Не подменяем сбой/мусор модели на «всё хорошо».
+        return [{"id": "classification_uncertain", "label": "Классификация неуверенна"}]
     if any(item["id"] != "ok" for item in chosen):
         chosen = [item for item in chosen if item["id"] != "ok"]
     return chosen
@@ -476,21 +478,37 @@ def _excerpt_answer(hits: list[Hit]) -> str:
     return "\n\n".join(chunks)
 
 
-def _collect_hits(question: str, top_k: int) -> list[Hit]:
-    raw = knowledge_base().search(_topic_question(question), limit=max(top_k * 4, 16))
+def _collect_hits(
+    question: str,
+    top_k: int,
+    allowed_documents: list[dict] | None = None,
+) -> list[Hit]:
+    # Берём запас кандидатов, затем режем по ACL — до генерации ответа.
+    raw = knowledge_base().search(_topic_question(question), limit=max(top_k * 8, 32))
     text = [hit for hit in raw if hit.kind != "image" and hit.score >= MIN_HIT_SCORE]
+    text = filter_hits(text, allowed_documents)
     return text[:top_k]
 
 
-def ask(question: str, top_k: int = TOP_K) -> Answer:
+def ask(
+    question: str,
+    top_k: int = TOP_K,
+    *,
+    allowed_documents: list[dict] | None = None,
+    history: list[dict] | None = None,
+    access: dict | None = None,
+    step_context: dict | None = None,
+    address_style: str = "formal",
+) -> Answer:
     question = (question or "").strip()
     if not question:
         raise ValueError("Пустой вопрос.")
     tone = analyze_tone(question)
     work = is_work_question(question) and not tone.needs_manager and not tone.needs_hr
-    hits = _collect_hits(question, top_k) if work else []
+    # None = без ACL (локальный клиент); [] / список = только разрешённые документы.
+    hits = _collect_hits(question, top_k, allowed_documents) if work else []
     if work and not hits:
-        answer = Answer(text=NO_INFO, mode="rag", tone=tone.label)
+        answer = Answer(text=NO_INFO, mode="rag", tone=tone.label, needs_hr=True)
         _save_answer(answer)
         return answer
 
@@ -505,12 +523,21 @@ def ask(question: str, top_k: int = TOP_K) -> Answer:
         mode = "chat"
     context_hits = hits if mode == "rag" else []
     if mode == "manager":
-        text = "Понял вас."
+        text = "Понял вас. Передам сигнал руководителю — обсудите ситуацию лично."
     elif mode == "hr":
         text = tone.reply or (HR_NO_INFO if tone.hr_topic else _hr_distress_reply(tone.urgent))
     else:
-        prompt = _prompt(question, context_hits, images, strict=bool(context_hits))
-        system = _system(mode)
+        prompt = _prompt(
+            question,
+            context_hits,
+            images,
+            strict=bool(context_hits),
+            history=history,
+            access=access,
+            step_context=step_context,
+            address_style=address_style,
+        )
+        system = _system(mode, address_style=address_style)
         text = vision().generate(prompt, system=system, max_new_tokens=MAX_NEW_TOKENS)
         if _says_no_info(text):
             excerpt = _excerpt_answer(context_hits)
@@ -520,30 +547,39 @@ def ask(question: str, top_k: int = TOP_K) -> Answer:
                 text = NO_INFO
                 images = []
                 context_hits = []
-    sources = _sources(context_hits) if context_hits else []
+    if mode == "rag" and allowed_documents is not None:
+        sources = map_sources(context_hits, allowed_documents)
+        if not sources:
+            text = NO_INFO
+            images = []
+            context_hits = []
+    else:
+        sources = _sources(context_hits) if context_hits else []
     answer = Answer(
         text=text,
         images=images if mode == "rag" else [],
         sources=sources,
         mode=mode,
         tone=tone.label,
-        needs_hr=tone.needs_hr and not tone.needs_manager,
+        needs_hr=(tone.needs_hr and not tone.needs_manager)
+        or (mode == "rag" and (not sources or text == NO_INFO)),
         needs_manager=tone.needs_manager,
     )
     _save_answer(answer)
     return answer
 
 
-def _add_one(path: Path, caption: bool, log) -> dict:
+def _add_one(path: Path, caption: bool, log, extra_meta: dict | None = None) -> dict:
     parsed = parse_file(path)
     source_hash = hashlib.sha1(parsed.source.encode("utf-8")).hexdigest()[:12]
     image_dir = IMAGE_DIR / source_hash
     if image_dir.exists():
         shutil.rmtree(image_dir)
     image_dir.mkdir(parents=True, exist_ok=True)
+    display_name = str((extra_meta or {}).get("korsik_title") or parsed.name)
     chunks, image_count, skipped = _chunks_from_blocks(
         parsed.source,
-        parsed.name,
+        display_name,
         parsed.blocks,
         image_dir,
         caption=caption,
@@ -553,20 +589,26 @@ def _add_one(path: Path, caption: bool, log) -> dict:
         shutil.rmtree(image_dir, ignore_errors=True)
         raise RuntimeError(f"Из {parsed.name} не получилось извлечь текст, таблицы или картинки.")
     base = knowledge_base()
+    korsik_id = str((extra_meta or {}).get("korsik_document_id") or "").strip()
+    if korsik_id:
+        base.delete_korsik_document(korsik_id)
     base.delete_source(parsed.source)
     records = []
     for index, chunk in enumerate(chunks):
+        metadata = {
+            "source": chunk.source,
+            "source_name": chunk.source_name,
+            "kind": chunk.kind,
+            "page": chunk.page,
+            "image_path": chunk.image_path,
+        }
+        if extra_meta:
+            metadata.update({key: value for key, value in extra_meta.items() if value is not None})
         records.append(
             {
                 "id": make_id(chunk.source, chunk.kind, chunk.page, index, chunk.text),
                 "text": _indexed_text(chunk),
-                "metadata": {
-                    "source": chunk.source,
-                    "source_name": chunk.source_name,
-                    "kind": chunk.kind,
-                    "page": chunk.page,
-                    "image_path": chunk.image_path,
-                },
+                "metadata": metadata,
             }
         )
     base.add(records)
@@ -772,8 +814,37 @@ def _prompt(
     hits: list[Hit],
     images: list[dict],
     strict: bool = False,
+    history: list[dict] | None = None,
+    access: dict | None = None,
+    step_context: dict | None = None,
+    address_style: str = "formal",
 ) -> str:
     parts = [f"Вопрос:\n{question}"]
+    if history:
+        lines = []
+        for item in history[-8:]:
+            role = str(item.get("role") or "user")
+            text = str(item.get("text") or "").strip()
+            if text:
+                lines.append(f"{role}: {text[:500]}")
+        if lines:
+            parts.append("Недавний диалог:\n" + "\n".join(lines))
+    context_bits = []
+    if access:
+        branch = str(access.get("branch_code") or "").strip()
+        category = str(access.get("category") or "").strip()
+        if branch:
+            context_bits.append(f"площадка {branch}")
+        if category:
+            context_bits.append(f"категория {category}")
+    if step_context:
+        stage = str(step_context.get("stage") or "").strip()
+        if stage:
+            context_bits.append(f"этап {stage}")
+    if context_bits:
+        parts.append("Контекст сотрудника: " + ", ".join(context_bits) + ".")
+    if address_style:
+        parts.append("Стиль обращения: " + ("на вы" if address_style == "formal" else "на ты") + ".")
     if hits:
         blocks = [f"[{index}] {hit.text}" for index, hit in enumerate(hits, start=1)]
         parts.append("Фрагменты базы знаний:\n" + "\n\n".join(blocks))
@@ -788,20 +859,51 @@ def _prompt(
     return "\n\n".join(parts)
 
 
-def _system(mode: str) -> str:
+def _system(mode: str, address_style: str = "formal") -> str:
+    address = "Обращайся на вы." if address_style == "formal" else "Можно обращаться на ты, сохраняя вежливость."
+    corporate = (
+        "Говори только в корпоративном деловом стиле: спокойно, уважительно, по делу, без сленга, шуток, "
+        "эмодзи, панибратства и разговорных сокращений. Ты корпоративный помощник по адаптации, не друг в чате."
+    )
     if mode == "chat":
         return (
-            "Отвечай сам, по-русски, полно и до конца мысли. "
+            f"{corporate} "
+            "Отвечай по-русски полно и до конца мысли. "
             "Это общий разговор, не вопрос по документам: не упоминай базу знаний, файлы, страницы и источники. "
-            "Не обрывай ответ на полуслове."
+            f"{address} Не обрывай ответ на полуслове."
         )
     return (
-        "Это рабочий вопрос. Фрагменты уже отобраны по теме. Ответь по-русски полно и по делу, до конца мысли: "
+        f"{corporate} "
+        "Это рабочий вопрос. Фрагменты уже отобраны по теме и по правам доступа сотрудника. "
+        "Ответь по-русски полно и по делу, до конца мысли: "
         "правила, обязанности, пункты и цифры, которые в них есть. "
-        "Не добавляй то, чего во фрагментах нет. Не обрывай ответ на полуслове. "
+        "Не добавляй то, чего во фрагментах нет. Не используй знания из других филиалов или документов. "
+        f"{address} Не обрывай ответ на полуслове. "
         "Просьба показать картинки уже выполнена отдельно и не повод отказывать. "
         "Фразу «В базе знаний нет информации по этому вопросу.» напиши только если фрагменты про другую тему, и больше ничего."
     )
+
+
+def index_uploaded_file(
+    path: Path,
+    *,
+    document_id: str,
+    version: int,
+    title: str,
+    branch_codes: list | None = None,
+    categories: list | None = None,
+    caption: bool = False,
+    log=print,
+) -> dict:
+    """Индексация файла, загруженного из кабинета HR Корсика."""
+    extra = {
+        "korsik_document_id": str(document_id),
+        "korsik_version": int(version),
+        "korsik_title": str(title or path.name),
+        "branch_codes": list(branch_codes or []),
+        "categories": list(categories or []),
+    }
+    return _add_one(path, caption=caption, log=log, extra_meta=extra)
 
 
 def _save_answer(answer: Answer) -> None:
@@ -818,8 +920,10 @@ def _save_answer(answer: Answer) -> None:
     if answer.sources:
         lines.append("Источники:")
         for source in answer.sources:
-            page = f", стр. {source['page']}" if source["page"] else ""
-            lines.append(f"- {source['name']}{page} ({source['kind']})")
+            page = f", стр. {source['page']}" if source.get("page") else ""
+            label = source.get("name") or source.get("document_id") or "document"
+            kind = f" ({source['kind']})" if source.get("kind") else ""
+            lines.append(f"- {label}{page}{kind}")
     LAST_ANSWER_MD.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
 
